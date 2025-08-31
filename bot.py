@@ -1,6 +1,7 @@
 import os, json, time
 from dotenv import load_dotenv
 import vk_api
+import time
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 
 load_dotenv()
@@ -14,6 +15,7 @@ vk = session.get_api()
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 longpoll = VkBotLongPoll(session, int(os.getenv("GROUP_ID")))
 send = lambda **p: vk.messages.send(random_id=0, **p)
+HANDOFF_COOLDOWN = 60  # секунд
 
 # ---------- keyboards ----------
 def kb(rows, inline=False, one_time=False):
@@ -50,8 +52,7 @@ MAIN_KB = kb([
 ])
 
 BACK_KB = kb([
-    [ {"text":"🥗 Заказать через Яндекс Еду", "type":"open_link", "link": os.getenv("YANDEX_EDA_LINK")},
-      {"text":"🥗 Заказать через Яндекс Еду", "payload":"order"} ]
+    [ {"text":"🥗 Заказать через Яндекс Еду", "type":"open_link", "link": os.getenv("YANDEX_EDA_LINK")}]
 ])
 
 MORE_KB = kb([
@@ -69,8 +70,9 @@ FINAL_KB = kb([
 ])
 
 # ---------- state ----------
-STATE = {}  # user_id -> {"about_step": int}
-def reset(uid): STATE[uid] = {"about_step": 0}
+STATE = {}  # user_id -> {"about_step": int, "welcomed": bool}
+def reset(uid):
+    STATE[uid] = {"about_step": 0, "welcomed": False, "last_handoff": 0.0}
 
 # ---------- texts ----------
 GREET = (
@@ -91,6 +93,10 @@ DEALS = (
     "Промокод: SALE20\n"
     "Просто введи его при оформлении заказа, и ужин или обед станет ещё вкуснее.\n\n"
     "Хочешь перейти к заказу прямо сейчас?"
+)
+
+HUMAN_HANDOFF = (
+    "Мы получили твоё сообщение и скоро на него ответим!"
 )
 
 CONTEST = (
@@ -137,7 +143,9 @@ ABOUT_STEPS = [
 
 # ---------- handlers ----------
 def show_menu(user_id):
-    reset(user_id)
+    if user_id not in STATE:
+        reset(user_id)
+    STATE[user_id]["welcomed"] = True
     send(user_id=user_id, message=GREET, keyboard=MAIN_KB)
 
 def handle_order(user_id):
@@ -145,7 +153,7 @@ def handle_order(user_id):
 
 def handle_deals(user_id):
     send(user_id=user_id, message=DEALS, keyboard=kb([
-        [ {"text":"🥗 Перейти в Яндекс Еду", "payload":"order"} ],
+        [ {"text":"🥗 Заказать через Яндекс Еду", "type":"open_link", "link": os.getenv("YANDEX_EDA_LINK")} ],
         [ {"text":"🎁 Участвовать в конкурсе", "payload":"contest"},
           {"text":"🍴 Подробнее о блюдах", "payload":"about"} ]
     ]))
@@ -153,9 +161,22 @@ def handle_deals(user_id):
 def handle_contest(user_id):
     send(user_id=user_id, message=f"{CONTEST}\n\nСсылка: {VK_CONTEST_POST_URL}", keyboard=kb([
         [ {"text":"🎁 Перейти к посту", "payload":"contest_go"} ],
-        [ {"text":"🥗 Заказать через Яндекс Еду", "payload":"order"},
+        [ {"text":"🥗 Заказать через Яндекс Еду", "type":"open_link", "link": os.getenv("YANDEX_EDA_LINK")},
           {"text":"💸 Скидки и акции", "payload":"deals"} ]
     ]))
+
+def is_known_command(text: str) -> bool:
+    if not text:
+        return False
+    low = text.strip().lower()
+    known = {
+        "menu","меню","/start","start","начать","привет",
+        "order","перейти в яндекс еду","🥗 заказать через яндекс еду","🥗 перейти в яндекс еду",
+        "deals","скидки","акции","💸 скидки и акции","💸 скидки",
+        "contest","🎁 участвовать в конкурсе","contest_go","перейти к посту","🎁 перейти к посту",
+        "about","🍴 подробнее о блюдах","about_next","да, хочу знать больше"
+    }
+    return low in known
 
 def handle_about(user_id, next_step=False):
     STATE.setdefault(user_id, {"about_step": 0})
@@ -198,45 +219,62 @@ if __name__ == "__main__":
     while True:
         try:
             for event in longpoll.listen():
-                # 1) Входящее сообщение => только одно приветствие/ответ
+
+                # 1) Входящее сообщение от пользователя
                 if event.type == VkBotEventType.MESSAGE_NEW and event.from_user:
                     message = event.obj.message
                     user_id = message["from_id"]
+                    payload_raw = message.get("payload")
+                    text = (message.get("text") or "").strip()
 
-                    # если приходит payload — парсим команду
-                    payload = message.get("payload")
-                    if payload:
+                    # инициализация состояния
+                    if user_id not in STATE:
+                        reset(user_id)
+
+                    # 1.1 системная кнопка «Начать» (payload {"command":"start"})
+                    if payload_raw:
                         try:
-                            cmd = json.loads(payload).get("cmd", "")
-                            route_text(user_id, cmd); continue
+                            data = json.loads(payload_raw)
+                            if data.get("command") == "start":
+                                show_menu(user_id)
+                                continue
+                            cmd = data.get("cmd")
+                            if cmd:
+                                route_text(user_id, cmd)
+                                continue
                         except Exception:
                             pass
 
-                    # обычный текст
-                    text = message.get("text", "")
-                    # Сценарий: "при любом входящем сообщении отправляем приветствие" — БЕЗ дублей.
-                    # Поэтому если это первое касание/не команда — шлём привет и выходим.
-                    if text and text.strip().lower() not in (
-                        "order","deals","contest","contest_go","about","about_next",
-                        "меню","/start","start","начать","привет",
-                        "🥗 заказать через яндекс еду","💸 скидки и акции",
-                        "🎁 участвовать в конкурсе","🍴 подробнее о блюдах",
-                        "да, хочу знать больше","перейти в яндекс еду","перейти к посту"
-                    ):
-                        show_menu(user_id); continue
+                    # 1.2 Первое касание: любое сообщение -> приветствие и стоп
+                    if not STATE[user_id]["welcomed"]:
+                        show_menu(user_id)
+                        continue
 
-                    route_text(user_id, text); continue
+                    # 1.3 Уже приветствовали: если это наша команда — обычный роутинг
+                    if is_known_command(text):
+                        route_text(user_id, text)
+                        continue
 
-                # 2) Разрешение на сообщения (message_allow) => приветствие один раз
+                    # 1.4 Иначе — «свободный текст» вне сценария: автоответ с кулдауном
+                    now = time.time()
+                    last = STATE[user_id].get("last_handoff", 0)
+                    if now - last >= HANDOFF_COOLDOWN:
+                        send(user_id=user_id, message=HUMAN_HANDOFF)
+                        STATE[user_id]["last_handoff"] = now
+
+                # 2) Разрешение на сообщения (message_allow) => приветствие
                 if event.type == VkBotEventType.MESSAGE_ALLOW:
-                    user_id = event.obj["user_id"]
-                    show_menu(user_id); continue
+                    uid = event.obj["user_id"]
+                    show_menu(uid)
+                    continue
 
-                # 3) Подписка на сообщество (group_join) => приветствие один раз
+                # 3) Подписка на сообщество (group_join) => приветствие
                 if event.type == VkBotEventType.GROUP_JOIN:
-                    user_id = event.obj["user_id"]
-                    show_menu(user_id); continue
+                    uid = event.obj["user_id"]
+                    show_menu(uid)
+                    continue
 
         except Exception as e:
             print("Error:", e)
             time.sleep(2)
+
