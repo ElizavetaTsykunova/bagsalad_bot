@@ -52,7 +52,8 @@ MAIN_KB = kb([
 ])
 
 BACK_KB = kb([
-    [ {"text":"🥗 Заказать через Яндекс Еду", "type":"open_link", "link": os.getenv("YANDEX_EDA_LINK")}]
+    [ {"text":"🥗 Заказать через Яндекс Еду", "type":"open_link", "link": os.getenv("YANDEX_EDA_LINK")}],
+    [ {"text":"↩️ Меню", "payload":"menu"} ]
 ])
 
 MORE_KB = kb([
